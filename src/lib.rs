@@ -1,5 +1,18 @@
 use nih_plug::prelude::*;
 use std::sync::Arc;
+use aubio::Pitch;
+
+pub mod utils;
+use crate::utils::*;
+
+
+// Those are temporarily constants, but should eventually be turned into parameters:
+const BUFFER_SIZE:  usize            = 128;
+const HOP_SIZE:     usize            = 64;
+const PITCH_METHOD: aubio::PitchMode = aubio::PitchMode::Yinfast;
+const SAMPLE_RATE:  u32              = 44100;
+const MIN_PITCH:    f32              = 57.0;
+const MAX_PITCH:    f32              = 81.0;
 
 // This is a shortened version of the gain example with most comments removed, check out
 // https://github.com/robbert-vdh/nih-plug/blob/master/plugins/examples/gain/src/lib.rs to get
@@ -7,6 +20,9 @@ use std::sync::Arc;
 
 struct Aeolus {
     params: Arc<AeolusParams>,
+    pending_samples: Vec<f32>,
+    pending_index: usize,
+    pitch_analyzer: aubio::Result<Pitch>,
 }
 
 #[derive(Params)]
@@ -23,6 +39,9 @@ impl Default for Aeolus {
     fn default() -> Self {
         Self {
             params: Arc::new(AeolusParams::default()),
+            pending_samples: Vec::new(),
+            pending_index: 0,
+            pitch_analyzer: Err(aubio::Error::FailedInit),
         }
     }
 }
@@ -57,6 +76,21 @@ impl Default for AeolusParams {
     }
 }
 
+
+
+// The `Plugin` trait requires our `Aeolus` type to implement `Send`. It does not automatically do so
+// because it contains a `Pitch` field, which contains a raw pointer (see [1]).
+// From what I understand, this page [2] suggests that it's okay to implement `Send`
+// for a type that contains raw pointers, you just have to trust the (aubio-rs) library author...
+// which I do, otherwise I wouldn't be using the library?
+// I may have misunderstood something here, but this unsafe implementation is the only way forward
+// that I see, so I'll go with it and wait to see if something goes wrong.
+// [1] https://github.com/katyo/aubio-rs/blob/4697a1424f6e856ffbe91045a794529d4ecde8a8/src/pitch.rs#L210
+// [2] https://doc.rust-lang.org/nomicon/send-and-sync.html
+unsafe impl Send for Aeolus {}
+
+
+
 impl Plugin for Aeolus {
     const NAME: &'static str = "Aeolus";
     const VENDOR: &'static str = "Grégoire Locqueville";
@@ -68,8 +102,8 @@ impl Plugin for Aeolus {
     // The first audio IO layout is used as the default. The other layouts may be selected either
     // explicitly or automatically by the host or the user depending on the plugin API/backend.
     const AUDIO_IO_LAYOUTS: &'static [AudioIOLayout] = &[AudioIOLayout {
-        main_input_channels: NonZeroU32::new(2),
-        main_output_channels: NonZeroU32::new(2),
+        main_input_channels: NonZeroU32::new(1),
+        main_output_channels: NonZeroU32::new(1),
 
         aux_input_ports: &[],
         aux_output_ports: &[],
@@ -82,7 +116,7 @@ impl Plugin for Aeolus {
 
 
     const MIDI_INPUT: MidiConfig = MidiConfig::None;
-    const MIDI_OUTPUT: MidiConfig = MidiConfig::None;
+    const MIDI_OUTPUT: MidiConfig = MidiConfig::MidiCCs;
 
     const SAMPLE_ACCURATE_AUTOMATION: bool = true;
 
@@ -108,27 +142,63 @@ impl Plugin for Aeolus {
         // Resize buffers and perform other potentially expensive initialization operations here.
         // The `reset()` function is always called right after this function. You can remove this
         // function if you do not need it.
+        self.pending_samples.resize(128, 0.0);
+        self.pitch_analyzer = Pitch::new(
+            PITCH_METHOD,
+            BUFFER_SIZE,
+            HOP_SIZE,
+            SAMPLE_RATE,
+        );
         true
     }
 
     fn reset(&mut self) {
-        // Reset buffers and envelopes here. This can be called from the audio thread and may not
-        // allocate. You can remove this function if you do not need it.
+        self.pending_index = 0;
+        // It does not seem to be possible to reset the state of an `aubio::Pitch`,
+        // so we won't do anything with it. It shouldn't make a difference
+        // once the supposedly small time that it takes to play in a buffer's worth
+        // of audio has elapsed.
+        // We could manually feed as many zeroes as needed to the object,
+        // but I don't think it's worth the hassle, so we don't do anything about that.
     }
 
     fn process(
         &mut self,
         buffer: &mut Buffer,
         _aux: &mut AuxiliaryBuffers,
-        _context: &mut impl ProcessContext<Self>,
+        context: &mut impl ProcessContext<Self>,
     ) -> ProcessStatus {
+        let mut sample_index = 0; // will be incremented at each new sample in the buffer
         for channel_samples in buffer.iter_samples() {
-            // Smoothing is optionally built into the parameters themselves
-            let gain = self.params.gain.smoothed.next();
-
-            for sample in channel_samples {
-                *sample *= gain;
+            // Add a sample into the buffer of pending audio
+            self.pending_samples[self.pending_index] = *channel_samples.into_iter().next().unwrap();
+            self.pending_index += 1;
+            // If the buffer of pending is filled, perform pitch analysis (if possible)
+            if self.pending_index >= HOP_SIZE {
+                match &mut self.pitch_analyzer {
+                    Err(_)                   => {} // pitch analyzer not available
+                    Ok(analyzer) => {
+                        match analyzer.do_result(&self.pending_samples) {
+                            Err(_) => {} // no pitch found
+                            Ok(frequency) => {
+                                context.send_event(NoteEvent::MidiCC {
+                                    timing: sample_index,
+                                    channel: 0,
+                                    cc: 1,
+                                    value: limit(
+                                        scale(
+                                            freq_to_midi(frequency),
+                                                MIN_PITCH, MAX_PITCH, 0.0, 127.0
+                                        ), 0.0, 127.0
+                                    ),
+                                })
+                            }
+                        };
+                    }
+                }
+                self.pending_index = 0;
             }
+            sample_index += 1;
         }
 
         ProcessStatus::Normal
@@ -142,7 +212,11 @@ impl ClapPlugin for Aeolus {
     const CLAP_SUPPORT_URL: Option<&'static str> = None;
 
     // TODO Don't forget to change these features
-    const CLAP_FEATURES: &'static [ClapFeature] = &[ClapFeature::AudioEffect, ClapFeature::Stereo];
+    const CLAP_FEATURES: &'static [ClapFeature] = &[
+        ClapFeature::NoteDetector,
+        ClapFeature::Analyzer,
+        ClapFeature::Utility,
+    ];
 }
 
 impl Vst3Plugin for Aeolus {
