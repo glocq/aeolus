@@ -13,10 +13,18 @@ pub fn scale(
     normalized * max_output_value + (1.0 - normalized) * min_output_value
 }
 
-pub fn limit(
+pub fn limit_f32(
     input:     f32,
     min_value: f32,
     max_value: f32,
 ) -> f32 {
     f32::min(max_value, f32::max(min_value, input))
+}
+
+pub fn limit_u8(
+    input:     u8,
+    min_value: u8,
+    max_value: u8,
+) -> u8 {
+    u8::min(max_value, u8::max(min_value, input))
 }

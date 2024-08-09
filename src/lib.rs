@@ -7,7 +7,7 @@ use crate::utils::*;
 
 
 // Those are temporarily constants, but should eventually be turned into parameters:
-const BUFFER_SIZE:  usize            = 128;
+const BUFFER_SIZE:  usize            = 1024;
 const HOP_SIZE:     usize            = 64;
 const PITCH_METHOD: aubio::PitchMode = aubio::PitchMode::Yinfast;
 const SAMPLE_RATE:  u32              = 44100;
@@ -19,6 +19,8 @@ const MAX_PITCH:    f32              = 81.0;
 // started
 
 struct Aeolus {
+    dbg_counter: u16,
+    dbg_current: u8,
     params: Arc<AeolusParams>,
     pending_samples: Vec<f32>,
     pending_index: usize,
@@ -38,6 +40,8 @@ struct AeolusParams {
 impl Default for Aeolus {
     fn default() -> Self {
         Self {
+            dbg_counter: 0,
+            dbg_current: 0,
             params: Arc::new(AeolusParams::default()),
             pending_samples: Vec::new(),
             pending_index: 0,
@@ -170,37 +174,57 @@ impl Plugin for Aeolus {
     ) -> ProcessStatus {
         let mut sample_index = 0; // will be incremented at each new sample in the buffer
         for channel_samples in buffer.iter_samples() {
+            self.dbg_counter += 1;
+
             // Add a sample into the buffer of pending audio
             self.pending_samples[self.pending_index] = *channel_samples.into_iter().next().unwrap();
             self.pending_index += 1;
+
             // If the buffer of pending is filled, perform pitch analysis (if possible)
-            if self.pending_index >= HOP_SIZE {
+            if self.pending_index >= HOP_SIZE - 1 {
+                self.pending_index = 0;
                 match &mut self.pitch_analyzer {
                     Err(_)                   => {} // pitch analyzer not available
                     Ok(analyzer) => {
                         match analyzer.do_result(&self.pending_samples) {
                             Err(_) => {} // no pitch found
                             Ok(frequency) => {
-                                context.send_event(NoteEvent::MidiCC {
-                                    timing: sample_index,
-                                    channel: 0,
-                                    cc: 1,
-                                    value: limit(
-                                        scale(
-                                            freq_to_midi(frequency),
-                                                MIN_PITCH, MAX_PITCH, 0.0, 127.0
-                                        ), 0.0, 127.0
-                                    ),
-                                })
+                                if self.dbg_counter > 4410 {
+                                    context.send_event(NoteEvent::NoteOff {
+                                        timing: 0,
+                                        voice_id: Some(0),
+                                        channel: 0,
+                                        note: self.dbg_current,
+                                        velocity: 0.0,
+                                    });
+                                    self.dbg_current = limit_u8(freq_to_midi(frequency).round() as u8, 0, 127);
+                                    context.send_event(NoteEvent::NoteOn {
+                                        timing: sample_index,
+                                        voice_id: Some(0),
+                                        channel: 0,
+                                        note: self.dbg_current, 
+                                        velocity: 0.5,
+                                    });
+                                    self.dbg_counter = 0;
+                                }
+                                // context.send_event(NoteEvent::MidiCC {
+                                //     timing: sample_index,
+                                //     channel: 0,
+                                //     cc: 1,
+                                //     value: limit(
+                                //         scale(
+                                //             freq_to_midi(frequency),
+                                //                 MIN_PITCH, MAX_PITCH, 0.0, 1.0
+                                //         ), 0.0, 1.0
+                                //     ),
+                                // })
                             }
                         };
                     }
                 }
-                self.pending_index = 0;
             }
             sample_index += 1;
         }
-
         ProcessStatus::Normal
     }
 }
